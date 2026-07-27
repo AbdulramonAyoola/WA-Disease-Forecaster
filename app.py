@@ -3,9 +3,117 @@ import pandas as pd
 import numpy as np
 import joblib
 import json
+from sklearn.linear_model import LinearRegression
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-malaria_model = joblib.load('malaria_model_final.pkl')
-dengue_model  = joblib.load('dengue_model_final.pkl')
+# ============================================================
+# TRAIN MODELS ON STARTUP
+# ============================================================
+
+print("Loading dataset and training models...")
+
+df_raw = pd.read_csv("west_africa_disease_dataset_v2.csv")
+df = df_raw.copy()
+df = df.sort_values(['country', 'year', 'month']).reset_index(drop=True)
+
+# WHO annual scaling
+who_annual_malaria = {
+    'Nigeria': 29000000, 'Burkina Faso': 11000000, 'Mali': 4800000,
+    'Guinea-Bissau': 600000, 'Liberia': 1200000, 'Mauritania': 350000, 'Togo': 1500000
+}
+who_annual_dengue = {
+    'Nigeria': 120000, 'Burkina Faso': 15000, 'Mali': 8000,
+    'Guinea-Bissau': 3000, 'Liberia': 5000, 'Mauritania': 2000, 'Togo': 12000
+}
+
+real_df = df[df['data_type'] == 'real'].copy()
+malaria_scale = {}
+dengue_scale  = {}
+
+for country in df['country'].unique():
+    country_real = real_df[real_df['country'] == country]
+    years = country_real['year'].unique()
+    annual_m, annual_d = [], []
+    for yr in years:
+        yr_data = country_real[country_real['year'] == yr]
+        annual_m.append(yr_data['malaria_cases'].sum())
+        annual_d.append(yr_data['dengue_cases'].sum())
+    malaria_scale[country] = who_annual_malaria[country] / np.mean(annual_m)
+    dengue_scale[country]  = who_annual_dengue[country]  / np.mean(annual_d)
+
+df['malaria_cases'] = df.apply(lambda r: int(r['malaria_cases'] * malaria_scale[r['country']]), axis=1)
+df['dengue_cases']  = df.apply(lambda r: int(r['dengue_cases']  * dengue_scale[r['country']]),  axis=1)
+
+# Cleaning
+df['air_quality_index'] = df['air_quality_index'].replace(0, np.nan)
+df['air_quality_index'] = df.groupby(['country','month'])['air_quality_index'].transform(lambda x: x.fillna(x.median()))
+df['air_quality_index'] = df.groupby('country')['air_quality_index'].transform(lambda x: x.fillna(x.median()))
+df['precipitation_mm'] = df['precipitation_mm'].replace(0, np.nan)
+df['precipitation_mm'] = df.groupby(['country','month'])['precipitation_mm'].transform(lambda x: x.fillna(x.median()))
+df['precipitation_mm'] = df.groupby('country')['precipitation_mm'].transform(lambda x: x.fillna(x.median()))
+
+# Feature engineering
+df['season']      = df['month'].apply(lambda m: 1 if 5 <= m <= 10 else 0)
+df['temp_x_rain'] = df['avg_temp_c'] * df['precipitation_mm']
+
+lag_cols = ['malaria_lag_1','malaria_lag_2','dengue_lag_1','dengue_lag_2','rainfall_lag_1','temp_lag_1']
+df = df.drop(columns=lag_cols + ['log_malaria','log_dengue'], errors='ignore')
+
+df['malaria_lag_1']  = df.groupby('country')['malaria_cases'].shift(1)
+df['malaria_lag_2']  = df.groupby('country')['malaria_cases'].shift(2)
+df['dengue_lag_1']   = df.groupby('country')['dengue_cases'].shift(1)
+df['dengue_lag_2']   = df.groupby('country')['dengue_cases'].shift(2)
+df['rainfall_lag_1'] = df.groupby('country')['precipitation_mm'].shift(1)
+df['temp_lag_1']     = df.groupby('country')['avg_temp_c'].shift(1)
+
+df = df.dropna(subset=lag_cols).reset_index(drop=True)
+
+df['log_malaria'] = np.log1p(df['malaria_cases'])
+df['log_dengue']  = np.log1p(df['dengue_cases'])
+
+# Train/test split
+feature_cols = [
+    'country', 'month', 'quarter', 'season',
+    'avg_temp_c', 'precipitation_mm', 'air_quality_index',
+    'uv_index', 'population_density', 'healthcare_budget',
+    'temp_x_rain', 'rainfall_lag_1', 'temp_lag_1',
+    'malaria_lag_1', 'malaria_lag_2', 'dengue_lag_1', 'dengue_lag_2'
+]
+
+categorical_features = ['country']
+numerical_features   = [f for f in feature_cols if f != 'country']
+
+train_df = df[df['year'] <= 2023]
+X_train  = train_df[feature_cols]
+y_train_m = train_df['log_malaria']
+y_train_d = train_df['log_dengue']
+
+# Train pipelines
+malaria_pipeline = Pipeline([
+    ('preprocessor', ColumnTransformer([
+        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features),
+        ('num', StandardScaler(), numerical_features)
+    ])),
+    ('regressor', LinearRegression())
+])
+malaria_pipeline.fit(X_train, y_train_m)
+
+dengue_pipeline = Pipeline([
+    ('preprocessor', ColumnTransformer([
+        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features),
+        ('num', StandardScaler(), numerical_features)
+    ])),
+    ('regressor', LinearRegression())
+])
+dengue_pipeline.fit(X_train, y_train_d)
+
+print("Models trained successfully.")
+
+# ============================================================
+# APP CONFIG
+# ============================================================
 
 with open('country_population.json') as f:
     country_population = json.load(f)
@@ -129,8 +237,8 @@ def predict(country, year, month,
             'dengue_lag_2': dengue_lag_2,
         }])
 
-        malaria_pred = max(0, int(np.expm1(malaria_model.predict(sample)[0])))
-        dengue_pred  = max(0, int(np.expm1(dengue_model.predict(sample)[0])))
+        malaria_pred = max(0, int(np.expm1(malaria_pipeline.predict(sample)[0])))
+        dengue_pred  = max(0, int(np.expm1(dengue_pipeline.predict(sample)[0])))
         malaria_risk = get_risk_level(malaria_pred, population)
         dengue_risk  = get_risk_level(dengue_pred,  population)
         report       = build_report(country, month, year, malaria_pred,
@@ -193,7 +301,6 @@ FOOTER = """
 css = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
 * { font-family: 'Inter', sans-serif !important; }
-
 .section-label {
     font-size: 10px !important; font-weight: 600 !important;
     letter-spacing: 0.08em !important; color: #0d9488 !important;
@@ -214,36 +321,25 @@ css = """
 }
 .nav-btn:hover { background: #2d2d4e !important; }
 label { font-size: 12px !important; color: #475569 !important; }
-
 .home-run-btn-overlay {
-    background: #0d9488 !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 6px !important;
-    font-size: 13px !important;
-    font-weight: 500 !important;
-    height: 46px !important;
-    width: 180px !important;
-    display: block !important;
-    margin: 0 auto !important;
+    background: #0d9488 !important; color: white !important;
+    border: none !important; border-radius: 6px !important;
+    font-size: 13px !important; font-weight: 500 !important;
+    height: 46px !important; width: 180px !important;
+    display: block !important; margin: 0 auto !important;
     position: static !important;
 }
 .home-run-btn-overlay:hover { background: #0f766e !important; }
-
-.gradio-container .home-run-btn-overlay {
-    background: #0d9488 !important;
-}
+.gradio-container .home-run-btn-overlay { background: #0d9488 !important; }
 """
 
 with gr.Blocks(css=css, title="Infectious Disease Forecaster") as app:
 
-    # ── PAGE 1: HOME ─────────────────────────────────────────
     with gr.Column(visible=True) as home_page:
 
         gr.HTML("""
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
         <div style="background:#1a1a2e; border-radius:10px 10px 0 0; font-family:Inter,sans-serif;">
-
           <div style="padding:14px 32px; display:flex; align-items:center; justify-content:space-between;">
             <div style="display:flex; align-items:center; gap:8px;">
               <div style="width:28px; height:28px; background:#0d9488; border-radius:50%; display:flex; align-items:center; justify-content:center;">
@@ -256,7 +352,6 @@ with gr.Blocks(css=css, title="Infectious Disease Forecaster") as app:
               <span style="color:#94a3b8; font-size:12px; cursor:pointer;">Dataset</span>
             </div>
           </div>
-
           <div style="padding:40px 32px 32px; text-align:center;">
             <span style="background:rgba(13,148,136,0.15); color:#5eead4; font-size:10px; padding:3px 12px; border-radius:20px; border:0.5px solid rgba(13,148,136,0.35); display:inline-block; margin-bottom:18px;">
               Powered by Linear Regression
@@ -276,28 +371,14 @@ with gr.Blocks(css=css, title="Infectious Disease Forecaster") as app:
 
         gr.HTML("""
         <div style="background:#1a1a2e; font-family:Inter,sans-serif;">
-
           <div style="padding:28px 32px 44px; text-align:center;">
             <div style="display:flex; justify-content:center; gap:56px;">
-              <div>
-                <div style="font-size:24px; font-weight:600; color:#0d9488;">490</div>
-                <div style="font-size:11px; color:#64748b; margin-top:3px;">Monthly records</div>
-              </div>
-              <div>
-                <div style="font-size:24px; font-weight:600; color:#0d9488;">0.99</div>
-                <div style="font-size:11px; color:#64748b; margin-top:3px;">Malaria R²</div>
-              </div>
-              <div>
-                <div style="font-size:24px; font-weight:600; color:#0d9488;">7</div>
-                <div style="font-size:11px; color:#64748b; margin-top:3px;">Countries covered</div>
-              </div>
-              <div>
-                <div style="font-size:24px; font-weight:600; color:#0d9488;">2</div>
-                <div style="font-size:11px; color:#64748b; margin-top:3px;">Diseases modelled</div>
-              </div>
+              <div><div style="font-size:24px; font-weight:600; color:#0d9488;">490</div><div style="font-size:11px; color:#64748b; margin-top:3px;">Monthly records</div></div>
+              <div><div style="font-size:24px; font-weight:600; color:#0d9488;">0.99</div><div style="font-size:11px; color:#64748b; margin-top:3px;">Malaria R²</div></div>
+              <div><div style="font-size:24px; font-weight:600; color:#0d9488;">7</div><div style="font-size:11px; color:#64748b; margin-top:3px;">Countries covered</div></div>
+              <div><div style="font-size:24px; font-weight:600; color:#0d9488;">2</div><div style="font-size:11px; color:#64748b; margin-top:3px;">Diseases modelled</div></div>
             </div>
           </div>
-
           <div style="background:#0d2137; padding:24px 32px; display:flex; justify-content:space-around; gap:8px;">
             <div style="text-align:center; flex:1;">
               <div style="width:36px; height:36px; background:rgba(13,148,136,0.15); border-radius:50%; display:flex; align-items:center; justify-content:center; margin:0 auto 10px;">
@@ -323,7 +404,6 @@ with gr.Blocks(css=css, title="Infectious Disease Forecaster") as app:
               <div style="font-size:10px; color:#64748b; line-height:1.6;">Receive case predictions, risk level, and summary report</div>
             </div>
           </div>
-
           <div style="padding:36px 32px; background:white;">
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:28px; align-items:start;">
               <div>
@@ -339,41 +419,21 @@ with gr.Blocks(css=css, title="Infectious Disease Forecaster") as app:
               <div style="background:#f8fafc; border-left:3px solid #0d9488; border-top:0.5px solid #e2e8f0; border-right:0.5px solid #e2e8f0; border-bottom:0.5px solid #e2e8f0; border-radius:0 10px 10px 0; padding:18px 20px;">
                 <div style="font-size:10px; font-weight:600; color:#0d9488; text-transform:uppercase; letter-spacing:0.07em; margin-bottom:14px;">Dataset facts</div>
                 <div style="display:flex; flex-direction:column; gap:10px;">
-                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;">
-                    <span style="font-size:12px; color:#64748b;">Total records</span>
-                    <span style="font-size:12px; font-weight:500; color:#1a1a2e;">490 monthly rows</span>
-                  </div>
-                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;">
-                    <span style="font-size:12px; color:#64748b;">Coverage period</span>
-                    <span style="font-size:12px; font-weight:500; color:#1a1a2e;">2020 to 2025</span>
-                  </div>
-                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;">
-                    <span style="font-size:12px; color:#64748b;">Countries</span>
-                    <span style="font-size:12px; font-weight:500; color:#1a1a2e;">7 West African nations</span>
-                  </div>
-                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;">
-                    <span style="font-size:12px; color:#64748b;">Diseases</span>
-                    <span style="font-size:12px; font-weight:500; color:#1a1a2e;">Malaria and Dengue fever</span>
-                  </div>
-                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;">
-                    <span style="font-size:12px; color:#64748b;">Model</span>
-                    <span style="font-size:12px; font-weight:500; color:#1a1a2e;">Linear Regression (OLS)</span>
-                  </div>
-                  <div style="display:flex; justify-content:space-between;">
-                    <span style="font-size:12px; color:#64748b;">Case scaling</span>
-                    <span style="font-size:12px; font-weight:500; color:#1a1a2e;">WHO annual estimates</span>
-                  </div>
+                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;"><span style="font-size:12px; color:#64748b;">Total records</span><span style="font-size:12px; font-weight:500; color:#1a1a2e;">490 monthly rows</span></div>
+                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;"><span style="font-size:12px; color:#64748b;">Coverage period</span><span style="font-size:12px; font-weight:500; color:#1a1a2e;">2020 to 2025</span></div>
+                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;"><span style="font-size:12px; color:#64748b;">Countries</span><span style="font-size:12px; font-weight:500; color:#1a1a2e;">7 West African nations</span></div>
+                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;"><span style="font-size:12px; color:#64748b;">Diseases</span><span style="font-size:12px; font-weight:500; color:#1a1a2e;">Malaria and Dengue fever</span></div>
+                  <div style="display:flex; justify-content:space-between; border-bottom:0.5px solid #e2e8f0; padding-bottom:8px;"><span style="font-size:12px; color:#64748b;">Model</span><span style="font-size:12px; font-weight:500; color:#1a1a2e;">Linear Regression (OLS)</span></div>
+                  <div style="display:flex; justify-content:space-between;"><span style="font-size:12px; color:#64748b;">Case scaling</span><span style="font-size:12px; font-weight:500; color:#1a1a2e;">WHO annual estimates</span></div>
                 </div>
               </div>
             </div>
           </div>
-
         </div>
         """)
 
         gr.HTML(FOOTER)
 
-    # ── PAGE 2: INPUT FORM ───────────────────────────────────
     with gr.Column(visible=False) as input_page:
 
         gr.HTML("""
@@ -440,7 +500,6 @@ with gr.Blocks(css=css, title="Infectious Disease Forecaster") as app:
 
         gr.HTML(FOOTER)
 
-    # ── PAGE 3: RESULTS ──────────────────────────────────────
     with gr.Column(visible=False) as results_page:
 
         gr.HTML("""
@@ -456,35 +515,18 @@ with gr.Blocks(css=css, title="Infectious Disease Forecaster") as app:
         results_html = gr.HTML()
         gr.HTML(FOOTER)
 
-    # ── EVENT HANDLERS ───────────────────────────────────────
-    home_run_btn.click(
-        fn=go_to_form,
-        outputs=[home_page, input_page, results_page]
-    )
-
-    home_btn1.click(
-        fn=go_home,
-        outputs=[home_page, input_page, results_page]
-    )
-
-    home_btn2.click(
-        fn=go_home,
-        outputs=[home_page, input_page, results_page]
-    )
-
+    home_run_btn.click(fn=go_to_form, outputs=[home_page, input_page, results_page])
+    home_btn1.click(fn=go_home, outputs=[home_page, input_page, results_page])
+    home_btn2.click(fn=go_home, outputs=[home_page, input_page, results_page])
     back_btn.click(
         fn=lambda: (gr.update(visible=False), gr.update(visible=True), gr.update(visible=False)),
         outputs=[home_page, input_page, results_page]
     )
-
     country.change(
         fn=update_country_defaults,
         inputs=[country],
-        outputs=[population_density, healthcare_budget,
-                 malaria_lag_1, malaria_lag_2,
-                 dengue_lag_1, dengue_lag_2]
+        outputs=[population_density, healthcare_budget, malaria_lag_1, malaria_lag_2, dengue_lag_1, dengue_lag_2]
     )
-
     run_btn.click(
         fn=predict,
         inputs=[
